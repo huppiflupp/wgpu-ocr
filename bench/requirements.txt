@@ -1,0 +1,5 @@
+rapidfuzz
+paddleocr
+paddlepaddle
+rapidocr
+onnxruntime-gpu

@@ -1,0 +1,23 @@
+[package]
+name = "wgpu-ocr"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Prototype: the ocrs OCR models on wgpu compute shaders, read straight from ONNX, with a whole-page pipeline overlapping GPU and CPU"
+repository = "https://github.com/huppiflupp/wgpu-ocr"
+publish = false
+
+[dependencies]
+wgpu = "30"
+pollster = "0.4"
+bytemuck = "1"
+half = "2"
+rten = { version = "=0.26.0", features = ["onnx_format"] }
+rten-tensor = "=0.26.0"
+rten-onnx = "=0.26.0"
+rten-imageproc = "=0.26.0"
+ocrs = { version = "=0.13.1", default-features = false, features = ["rten", "onnx"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[profile.release]
+debug = 1

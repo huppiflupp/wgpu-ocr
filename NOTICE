@@ -1,0 +1,10 @@
+wgpu-ocr is dual-licensed under MIT OR Apache-2.0.
+
+Third-party parts:
+
+- `word_rects` in src/bin/ocr-bench.rs follows `find_connected_component_rects` from ocrs
+  0.13.1 (src/detection.rs), Copyright Robert Knight, licensed MIT OR Apache-2.0.
+- The models are not part of this repository. scripts/fetch-models.sh downloads the ocrs
+  models (CC-BY-SA-4.0, Robert Knight, https://github.com/robertknight/ocrs-models).
+- The test pages in data/pages are rendered from the texts in data/ with PdfCraft
+  (https://github.com/storytold/pdfcraft); the texts were written for this benchmark.
