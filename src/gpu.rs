@@ -46,6 +46,7 @@ struct P { n: u32, cin: u32, h: u32, w: u32, cout: u32, oh: u32, ow: u32, kh: u3
 @group(0) @binding(3) var<storage, read_write> y: array<f32>;
 @group(0) @binding(4) var<uniform> p: P;
 @group(0) @binding(5) var<storage, read> res: array<f32>;  // added to the output when p.x0 == 1
+@group(0) @binding(6) var<storage, read> insc: array<f32>;  // [n][cin] input scale when p.x1 == 1
 var<workgroup> As: array<f32, 1024>;
 var<workgroup> Bs: array<f32, 1024>;
 EPILOGUE_FN
@@ -125,6 +126,7 @@ struct P { n: u32, cin: u32, h: u32, w: u32, cout: u32, oh: u32, ow: u32, kh: u3
 @group(0) @binding(3) var<storage, read_write> y: array<f32>;
 @group(0) @binding(4) var<uniform> p: P;
 @group(0) @binding(5) var<storage, read> res: array<f32>;  // added to the output when p.x0 == 1
+@group(0) @binding(6) var<storage, read> insc: array<f32>;  // [n][cin] input scale when p.x1 == 1
 var<workgroup> As: array<vec4<f32>, 512>;   // [16 k][128 m / 4]
 var<workgroup> Bs: array<vec4<f32>, 256>;   // [16 k][64 c / 4]
 EPILOGUE_FN
@@ -181,7 +183,10 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid
         for (var e = 0u; e < 8u; e++) {
             let kk = ka + e * 2u;
             var v = 0.0;
-            if (inside) { v = x[xbase + (ci0 + kk) * plane + pix]; }
+            if (inside) {
+                v = x[xbase + (ci0 + kk) * plane + pix];
+                if (p.x1 == 1u) { v *= insc[nb * p.cin + ci0 + kk]; }
+            }
             As[kk * 32u + mm / 4u][mm % 4u] = v;
         }
         for (var e = 0u; e < 4u; e++) {
@@ -215,6 +220,7 @@ struct P { n: u32, cin: u32, h: u32, w: u32, cout: u32, oh: u32, ow: u32, kh: u3
 @group(0) @binding(3) var<storage, read_write> y: array<f32>;
 @group(0) @binding(4) var<uniform> p: P;
 @group(0) @binding(5) var<storage, read> res: array<f32>;  // added to the output when p.x0 == 1
+@group(0) @binding(6) var<storage, read> insc: array<f32>;  // [n][cin] input scale when p.x1 == 1
 var<workgroup> As: array<vec4<f32>, 256>;   // [16 k][64 m / 4]
 var<workgroup> Bs: array<vec4<f32>, 256>;   // [16 k][64 c / 4]
 EPILOGUE_FN
@@ -271,7 +277,10 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid
         for (var e = 0u; e < 4u; e++) {
             let kk = ka + e * 4u;
             var v = 0.0;
-            if (inside) { v = x[xbase + (ci0 + kk) * plane + pix]; }
+            if (inside) {
+                v = x[xbase + (ci0 + kk) * plane + pix];
+                if (p.x1 == 1u) { v *= insc[nb * p.cin + ci0 + kk]; }
+            }
             As[kk * 16u + mm / 4u][mm % 4u] = v;
         }
         for (var e = 0u; e < 4u; e++) {
@@ -304,7 +313,10 @@ const CONV_FAST_LOAD: &str = r#"
         for (var e = 0u; e < 4u; e++) {
             let kk = kq + e * 4u;
             var v = 0.0;
-            if (inside) { v = x[xbase + (ci0 + kk) * plane + pix]; }
+            if (inside) {
+                v = x[xbase + (ci0 + kk) * plane + pix];
+                if (p.x1 == 1u) { v *= insc[nb * p.cin + ci0 + kk]; }
+            }
             As[kk * 64u + mm] = v;
             let c = c0 + mm;
             var wv = 0.0;
@@ -326,6 +338,7 @@ const CONV_GENERIC_LOAD: &str = r#"
                 let ix = ix0 + i32(r % p.kw);
                 if (iy >= 0 && iy < i32(p.h) && ix >= 0 && ix < i32(p.w)) {
                     v = x[xbase + ci * plane + u32(iy) * p.w + u32(ix)];
+                    if (p.x1 == 1u) { v *= insc[nb * p.cin + ci]; }
                 }
             }
             As[kk * 64u + mm] = v;
@@ -994,6 +1007,35 @@ impl Gpu {
         let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
     }
 
+    /// Submit `enc` with copies of several buffers' first `count` 32-bit values; one wait.
+    pub fn read_many(&self, mut enc: wgpu::CommandEncoder, bufs: &[(Buf, usize)]) -> Vec<Vec<u32>> {
+        let total: usize = bufs.iter().map(|b| b.1).sum();
+        let read = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: (total.max(1) * 4) as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut off = 0u64;
+        for (b, n) in bufs {
+            enc.copy_buffer_to_buffer(b, 0, &read, off, (*n * 4) as u64);
+            off += (*n * 4) as u64;
+        }
+        self.queue.submit([enc.finish()]);
+        read.slice(..).map_async(wgpu::MapMode::Read, |r| r.unwrap());
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        let view = read.slice(..).get_mapped_range().unwrap();
+        let all: Vec<u32> = bytemuck::cast_slice::<u8, u32>(&view[..]).to_vec();
+        drop(view);
+        let mut out = Vec::new();
+        let mut at = 0;
+        for (_, n) in bufs {
+            out.push(all[at..at + n].to_vec());
+            at += n;
+        }
+        out
+    }
+
     /// Submit `enc` with a copy of `floats` values of `buf` and return them.
     pub fn read(&self, mut enc: wgpu::CommandEncoder, buf: &Buf, floats: usize) -> Vec<f32> {
         let read = self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -1217,7 +1259,7 @@ impl Graph {
                     let wide = *fast && std::env::var_os("NO128").is_none();
                     let vec = *fast && std::env::var_os("CONVV").is_some();
                     let (pipe, mtile) = if wide && !vec { ("conv128", 128) } else if vec { ("conv64v", 64) } else if *fast { ("conv_fast", 64) } else { ("conv", 64) };
-                    gpu.dispatch(enc, pipe, &[&a.buf, wt, b, &y, &p, &a.buf], ((n * oh * ow).div_ceil(mtile) as u32, cout.div_ceil(64) as u32));
+                    gpu.dispatch(enc, pipe, &[&a.buf, wt, b, &y, &p, &a.buf, &a.buf], ((n * oh * ow).div_ceil(mtile) as u32, cout.div_ceil(64) as u32));
                     keep.push(p);
                     Tensor { buf: y, shape: [n, *cout, oh, ow] }
                 }

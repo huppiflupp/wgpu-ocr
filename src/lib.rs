@@ -10,4 +10,5 @@
 pub mod gpu;
 pub mod nd;
 pub mod onnx;
+pub mod ppdet;
 pub mod ppocr;

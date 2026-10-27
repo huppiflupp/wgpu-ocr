@@ -3,7 +3,7 @@
 OCR models running on **wgpu compute shaders**: Vulkan, Metal, DX12, and later WebGPU. It reads the model graph and weights straight from the `.onnx` files in Rust, with no ML framework and no vendor runtime (CUDA, ROCm).
 
 - **The [ocrs](https://github.com/robertknight/ocrs) models**, text detection and recognition, with hand-written kernels for their convolutions and GRU.
-- **[PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR)'s PP-OCRv6 text recognition** (CNN backbone, SVTR transformer neck, CTC head), on a general ONNX graph executor.
+- **[PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR)'s PP-OCRv6 text detection and recognition** (recognition: CNN backbone, SVTR transformer neck, CTC head), on a general ONNX graph executor.
 - **A whole-page pipeline** that overlaps GPU and CPU across pages.
 
 **Status: prototype.** It was written to answer [storytold/pdfcraft#2285](https://github.com/storytold/pdfcraft/issues/2285) ("OCR should be GPU accelerated") with measurements, and it is not a finished library: errors still panic, the tuning is per device, and there is no API stability. It is published so others can reuse the kernels, the executor and the numbers.
@@ -14,19 +14,22 @@ OCR models running on **wgpu compute shaders**: Vulkan, Metal, DX12, and later W
 
 ### Speed: ocrs on the CPU against this pipeline
 
-| Machine | ocrs on the CPU, page by page | wgpu-ocr, ocrs models | wgpu-ocr, PP-OCRv6 recognition |
-|---|---|---|---|
-| Core Ultra 5 245K (14 cores) + RTX 5080, Vulkan | 581 ms | **85 ms** (6.9×) | **103 ms** (5.7×) |
-| Ryzen AI Max+ 395 (16 cores), Radeon 8060S iGPU, RADV | 545 ms | **154 ms** (3.5×) | **242 ms** (2.2×) |
+| Machine | ocrs on the CPU, page by page | wgpu-ocr, ocrs models | ocrs detection + PP-OCRv6 recognition | PP-OCRv6 detection + recognition |
+|---|---|---|---|---|
+| Core Ultra 5 245K (14 cores) + RTX 5080, Vulkan | 581 ms | **85 ms** (6.9×) | **97 ms** (6.0×) | **136 ms** (4.4×) |
+| Ryzen AI Max+ 395 (16 cores), Radeon 8060S iGPU, RADV | 545 ms | **154 ms** (3.5×) | 242 ms (2.2×)¹ | not measured yet¹ |
 
-Both wgpu-ocr columns use the ocrs detection model on the GPU, ocrs' line finding with line padding, and overlap GPU and CPU.
+All wgpu-ocr columns run everything on the GPU and overlap GPU and CPU across pages. With ocrs detection, ocrs finds the lines (with line padding). With PP-OCRv6 detection, its DB boxes are the lines.
+
+¹ Measured before the sorted batching. The iGPU was busy with other work when these changes were made.
 
 ### Against other engines (Core Ultra 5 245K + RTX 5080, the 4 pages of `A_300`)
 
 | Engine | ms per page | CER | WER |
 |---|---|---|---|
 | **wgpu-ocr**, ocrs models (line padding, GPU) | **85** | **0.01 %** | **0.05 %** |
-| **wgpu-ocr**, PP-OCRv6 recognition (GPU) | **103** | **0.00 %** | **0.00 %** |
+| **wgpu-ocr**, ocrs detection + PP-OCRv6 recognition (GPU) | **97** | **0.00 %** | **0.00 %** |
+| **wgpu-ocr**, PP-OCRv6 detection + recognition (GPU) | **136** | **0.00 %** | **0.00 %** |
 | ocrs 0.13.1 on the CPU (as shipped) | 581 | 0.65 % | 4.32 % |
 | Tesseract 5.5.3, one process | 1048 | 0.00 % | 0.00 % |
 | Tesseract 5.5.3, 14 processes in parallel (throughput) | 128 | 0.00 % | 0.00 % |
@@ -37,7 +40,7 @@ Both wgpu-ocr columns use the ocrs detection model on the GPU, ocrs' line findin
 
 On the Ryzen AI Max+ 395, Tesseract with 16 to 32 parallel processes reaches **110 ms per page**. That is faster than this pipeline on that iGPU (154 ms).
 
-Over all validation pages (two texts, 150–400 dpi), PP-OCRv6 recognition makes 1 word error in 9,760 words. That is the same as running the model on rten on the CPU: at every one of 28,312 time steps the GPU and rten choose the same character, and the probabilities differ by at most 0.001. Unlike the ocrs models, PP-OCRv6 also reads accented letters, Cyrillic, Greek and CJK (18,708 characters).
+Over all validation pages (two texts, 150–400 dpi), PP-OCRv6 recognition after ocrs detection makes 1 word error in 9,760 words, and after PP-OCRv6 detection none. That is the same as running the model on rten on the CPU: at every one of 28,312 time steps the GPU and rten choose the same character, and the probabilities differ by at most 0.001. Unlike the ocrs models, PP-OCRv6 also reads accented letters, Cyrillic, Greek and CJK (18,708 characters).
 
 How to read this table:
 - **The test pages are clean synthetic renders.** Real scans (noise, skew, tables) may rank the engines differently.
@@ -58,6 +61,11 @@ How to read this table:
   - Kernels: elementwise with broadcasting, unary functions (Erf, HardSigmoid, Sqrt…), ReduceMean, Softmax, batched GEMM, one strided copy for Transpose, Slice and Concat, pooling with stride and padding (`SAME_UPPER`), BatchNorm as a channel affine, and an arg-max per row.
   - Fusions at load time: Identity nodes are dropped; Conv takes its bias Add, Relu, the exporter's GELU chain (Div → Erf → Add → Mul → Mul) and a following residual Add; MatMul takes its bias and SiLU (Sigmoid → Mul). The final Softmax is skipped, and the arg-max runs on the GPU instead of reading back 18,710 classes per step.
 - **`src/ppocr.rs`.** PaddleOCR's dictionary, line preprocessing (height 48, normalised to −1…1) and greedy CTC.
+- **`src/ppdet.rs`.** PP-OCRv6 detection around the model: the DB post-processing (threshold 0.2, contours, minimum-area rectangle, box score ≥ 0.45, unclip by area × 1.4 / perimeter) and reading order.
+  - The input (BGR, ImageNet-normalised, resized to multiples of 32) is prepared on the GPU (`NdGraph::det_input`). The detector reads the page at most 1600 px on the long side (`DETMAX`): on the validation pages that was more accurate than the full page and 3× faster.
+  - Each box gets 0.1 of its height above and below. That narrows the recognition inputs, which are scaled to height 48, and removed the last word error.
+  - On the same input the probability map matches rten to 7e-5.
+  - The executor gained Resize (nearest), GlobalAveragePool and ConvTranspose with fused bias and activation.
 - **`src/bin/ppocr-bench.rs`.** PP-OCRv6 recognition on rten, on the GPU, or both (`ENGINE=both` compares every step).
 - **`src/bin/ocr-bench.rs`.** The whole-page pipeline against ocrs (`REC=ppocr` recognises with PP-OCRv6):
   - The GPU runs on its own thread with a job queue. While it reads page *k*, the CPU finds the words and lines of page *k+1*.
@@ -103,7 +111,9 @@ Settings, all optional environment variables:
 | `CPUSHARE` | share of recognition batches given to rten on the CPU | 0 | 0 |
 | `RELV`, `RELEND` | line padding as fractions of word height | 0.15, 0.1 | 0.15, 0.1 |
 | `REC` | `ppocr` recognises with PP-OCRv6 | | |
-| `PPGROUP` | PP-OCRv6 batches: line width rounded up to this | 256 | 256 |
+| `DET` | `ppocr` detects with PP-OCRv6 det | | |
+| `DETMAX` | long side the PP-OCRv6 detector reads at | 1600 | 1600 |
+| `PPGROUP` | PP-OCRv6 batches: 0 sorts lines by width and fills batches; n rounds widths to n | 0 | 0 |
 | `PPBATCH` | PP-OCRv6 lines per batch | 16 | 16 |
 | `REPEAT` | run the pages this many times | | |
 | `DUMP` | directory to write the text of each page to | | |
@@ -113,6 +123,8 @@ PP-OCRv6 (`scripts/fetch-models.sh` also fetches it):
 ```sh
 ENGINE=both target/release/ppocr-bench $(ls data/pages/A_300/*.png | sort -V)   # GPU against rten, step by step
 REC=ppocr NO128=1 REPEAT=3 target/release/ocr-bench $(ls data/pages/A_300/*.png | sort -V)
+DET=ppocr REC=ppocr NO128=1 REPEAT=3 target/release/ocr-bench $(ls data/pages/A_300/*.png | sort -V)
+DETCHECK=1 DET=ppocr REC=ppocr target/release/ocr-bench data/pages/A_300/Text_page_1.png   # detection against rten
 ```
 
 Comparing with other engines (Python 3.12, `pip install -r bench/requirements.txt`):

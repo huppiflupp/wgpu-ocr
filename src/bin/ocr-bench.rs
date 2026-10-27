@@ -8,6 +8,12 @@
 
 use wgpu_ocr::{gpu, nd, onnx, ppocr};
 
+/// DET=ppocr: detect with PP-OCRv6 det (models/ppocr) and its DB post-processing; its boxes are
+/// the lines (no ocrs line finding, no line padding).
+fn use_ppdet() -> bool {
+    std::env::var("DET").is_ok_and(|v| v == "ppocr")
+}
+
 /// REC=ppocr: recognise with PP-OCRv6 (models/ppocr) instead of the ocrs recogniser.
 fn use_ppocr() -> bool {
     std::env::var("REC").is_ok_and(|v| v == "ppocr")
@@ -136,9 +142,14 @@ fn gpu_thread(jobs: mpsc::Receiver<Job>, done: mpsc::Sender<Done>, threshold: f3
         } else {
             None
         };
-        Ok((gpu, det, rec, pp))
+        let ppdet = if use_ppdet() {
+            Some(nd::NdGraph::new(&gpu, &onnx::Onnx::load(&format!("{models}/ppocr/PP-OCRv6_small_det.onnx"))?, false)?)
+        } else {
+            None
+        };
+        Ok((gpu, det, rec, pp, ppdet))
     })();
-    let (gpu, det, rec, pp) = match setup {
+    let (gpu, det, rec, pp, ppdet) = match setup {
         Ok(s) => {
             let _ = ready.send(Ok(s.0.adapter.clone()));
             s
@@ -164,8 +175,52 @@ fn gpu_thread(jobs: mpsc::Receiver<Job>, done: mpsc::Sender<Done>, threshold: f3
         // Detections first: the CPU waits for them; recognitions merge into one pass.
         let (detects, recs): (Vec<Job>, Vec<Job>) = pending.drain(..).partition(|j| matches!(j, Job::Detect { .. }));
         for j in detects {
+            let t_det = Instant::now();
             if let Job::Detect { page, rgb, w, h } = j {
-                let _ = done.send(Done::Mask(page, det.detect_page(&gpu, &rgb, w, h, threshold)));
+                let result = match &ppdet {
+                    // The probability map, after a header [w, h, to-page x, to-page y].
+                    Some(graph) => (|| -> Result<Vec<u32>, String> {
+                        let t0 = Instant::now();
+                        // The long side the detector reads at; 1600 was the most accurate on the
+                        // validation pages (150-400 dpi) and much faster than the full page.
+                        let max_side: usize = std::env::var("DETMAX").ok().and_then(|v| v.parse().ok()).unwrap_or(1600);
+                        let mut enc = gpu.encoder();
+                        let mut scratch = Vec::new();
+                        // CPUPREP=1: prepare the input on the CPU instead (and check against it).
+                        let input = if std::env::var_os("CPUPREP").is_some() {
+                            wgpu_ocr::ppdet::det_input(&rgb, w, h, max_side)
+                        } else {
+                            let (t, to_page) = nd::NdGraph::det_input(&gpu, &mut enc, &rgb, w, h, max_side, &mut scratch);
+                            wgpu_ocr::ppdet::DetInput { data: Vec::new(), w: t.shape[3], h: t.shape[2], to_page, tensor: None }.with_tensor(t)
+                        };
+                        let t_prep = ms(t0);
+                        let x = input.tensor.clone().unwrap_or_else(|| nd::Tensor { buf: gpu.upload(&input.data), shape: vec![1, 3, input.h, input.w] });
+                        let prob = graph.run(&gpu, &mut enc, x, &mut scratch)?;
+                        let count = input.w * input.h;
+                        let values = gpu.read(enc, &prob.buf, count);
+                        gpu.recycle(scratch);
+                        if std::env::var_os("DETDEBUG").is_some() {
+                            eprintln!("  det page {page}: {}x{} input, preprocessing {t_prep:.0} ms, model + readback {:.0} ms", input.w, input.h, ms(t0) - t_prep);
+                        }
+                        if std::env::var_os("DETCHECK").is_some() {
+                            let model = rten::Model::load_file(format!("{models}/ppocr/PP-OCRv6_small_det.onnx")).map_err(|e| e.to_string())?;
+                            let cpu_in = wgpu_ocr::ppdet::det_input(&rgb, w, h, max_side);
+                            let x = NdTensor::from_data([1, 3, input.h, input.w], cpu_in.data.clone());
+                            let r: NdTensor<f32, 4> = model.run_one(x.view().into(), None).map_err(|e| e.to_string())?.try_into().map_err(|e| format!("{e:?}"))?;
+                            let diff = r.iter().zip(&values).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+                            let flips = r.iter().zip(&values).filter(|(a, b)| (**a > 0.2) != (**b > 0.2)).count();
+                            eprintln!("  detection page {page}: GPU vs rten max |Δp| {diff:.6}, {flips} of {count} pixels on the other side of 0.2");
+                        }
+                        let mut out = vec![input.w as u32, input.h as u32, input.to_page[0].to_bits(), input.to_page[1].to_bits()];
+                        out.extend(values.iter().map(|v| v.to_bits()));
+                        Ok(out)
+                    })(),
+                    None => det.detect_page(&gpu, &rgb, w, h, threshold),
+                };
+                let _ = done.send(Done::Mask(page, result));
+                if std::env::var_os("GPUTIME").is_some() {
+                    eprintln!("  gpu thread: detection page {page} {:.0} ms", ms(t_det));
+                }
             }
         }
         held.extend(recs.into_iter().filter_map(|j| if let Job::Recognize(r) = j { Some(r) } else { None }));
@@ -173,32 +228,57 @@ fn gpu_thread(jobs: mpsc::Receiver<Job>, done: mpsc::Sender<Done>, threshold: f3
             continue;
         }
         let recs: Vec<RecPage> = std::mem::take(&mut held);
+        let t_rec = Instant::now();
+        let rec_lines: usize = recs.iter().map(|r| r.order.len()).sum();
+        let rec_pages: Vec<usize> = recs.iter().map(|r| r.page).collect();
+        let rec_batches: usize = recs.iter().map(|r| r.batches.len()).sum();
+        let report = |what: &str| {
+            if std::env::var_os("GPUTIME").is_some() {
+                eprintln!("  gpu thread: {what} pages {rec_pages:?}, {rec_lines} lines in {rec_batches} batches, {:.0} ms", ms(t_rec));
+            }
+        };
         if let Some((graph, dict)) = &pp {
-            // PP-OCRv6: each batch [n, 3, 48, width] through the graph, arg-max on the GPU.
-            for r in recs {
-                let part = (|| -> Result<Vec<(usize, String)>, String> {
-                    let mut out = Vec::new();
-                    let mut k = 0;
-                    for (data, n, w) in &r.batches {
-                        let mut enc = gpu.encoder();
-                        let mut scratch = Vec::new();
-                        let t0 = Instant::now();
+            // PP-OCRv6: every batch of the pages waiting through the graph and its arg-max in one
+            // encoder, read back with a single wait.
+            let result = (|| -> Result<Vec<(usize, Vec<(usize, String)>)>, String> {
+                let mut enc = gpu.encoder();
+                let mut scratch = Vec::new();
+                let mut outs = Vec::new();
+                let mut meta = Vec::new();
+                for (ri, r) in recs.iter().enumerate() {
+                    for (bi, (data, n, w)) in r.batches.iter().enumerate() {
                         let logits = graph.run(&gpu, &mut enc, nd::Tensor { buf: gpu.upload(data), shape: vec![*n, 3, ppocr::HEIGHT, *w] }, &mut scratch)?;
-                        let recorded = ms(t0);
-                        let steps = logits.shape[1];
-                        let best = graph.argmax(&gpu, enc, &logits);
-                        if std::env::var_os("RECTIME").is_some() {
-                            eprintln!("    batch {n}x{w}: recording {recorded:.1} ms, total {:.1} ms", ms(t0));
-                        }
-                        gpu.recycle(scratch);
-                        for j in 0..*n {
-                            out.push((r.order[k], dict.decode(&best[j * steps..(j + 1) * steps])));
-                            k += 1;
-                        }
+                        let (buf, rows) = graph.argmax_record(&gpu, &mut enc, &logits);
+                        scratch.push(buf.clone());
+                        outs.push((buf, rows));
+                        meta.push((ri, bi, *n, logits.shape[1]));
                     }
-                    Ok(out)
-                })();
-                let _ = done.send(Done::Part(r.page, part));
+                }
+                let read = gpu.read_many(enc, &outs);
+                gpu.recycle(scratch);
+                let mut parts: Vec<(usize, Vec<(usize, String)>)> = recs.iter().map(|r| (r.page, Vec::new())).collect();
+                let mut k_of: Vec<usize> = vec![0; recs.len()];
+                for ((ri, _, n, steps), best) in meta.into_iter().zip(read) {
+                    for j in 0..n {
+                        let line = recs[ri].order[k_of[ri]];
+                        k_of[ri] += 1;
+                        parts[ri].1.push((line, dict.decode(&best[j * steps..(j + 1) * steps])));
+                    }
+                }
+                Ok(parts)
+            })();
+            match result {
+                Ok(parts) => {
+                    report("recognition");
+                    for (page, part) in parts {
+                        let _ = done.send(Done::Part(page, Ok(part)));
+                    }
+                }
+                Err(e) => {
+                    for r in &recs {
+                        let _ = done.send(Done::Part(r.page, Err(e.clone())));
+                    }
+                }
             }
             continue;
         }
@@ -243,10 +323,30 @@ fn pp_batches(rgb: &[u8], w: usize, h: usize, lines: &[Vec<RotatedRect>]) -> (Ve
         let handles: Vec<_> = boxes.chunks(chunk).map(|bs| scope.spawn(move || bs.iter().map(|(i, b)| (*i, ppocr::line_input(rgb, w, h, *b))).collect::<Vec<_>>())).collect();
         handles.into_iter().flat_map(|hd| hd.join().unwrap_or_default()).collect()
     });
+    // PPGROUP=0 (default): sorted by width and cut into full batches; n > 0: widths rounded to n.
+    let round: usize = std::env::var("PPGROUP").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    if round == 0 {
+        // Sorted by width and cut into full batches: the fewest batches, each padded only to its
+        // widest line.
+        let mut sorted: Vec<&(usize, (Vec<f32>, usize))> = crops.iter().collect();
+        sorted.sort_by_key(|c| c.1.1);
+        let per: usize = std::env::var("PPBATCH").ok().and_then(|v| v.parse().ok()).unwrap_or(16);
+        let (mut batches, mut order) = (Vec::new(), Vec::new());
+        for part in sorted.chunks(per) {
+            let width = part.iter().map(|c| c.1.1).max().unwrap_or(8).next_multiple_of(8);
+            let refs: Vec<&(Vec<f32>, usize)> = part.iter().map(|c| &c.1).collect();
+            batches.push((ppocr::batch(&refs, width), part.len(), width));
+            order.extend(part.iter().map(|c| c.0));
+        }
+        if std::env::var_os("PPDEBUG").is_some() {
+            eprintln!("  pp batches: {:?}; first boxes {:?}", batches.iter().map(|b| (b.1, b.2)).collect::<Vec<_>>(), boxes.iter().take(2).map(|(_, b)| b.map(|v| v as i32)).collect::<Vec<_>>());
+        }
+        let widths = vec![0; order.len()];
+        return (batches, order, widths);
+    }
     let mut groups: BTreeMap<usize, Vec<&(usize, (Vec<f32>, usize))>> = BTreeMap::new();
     for c in &crops {
         // PPGROUP: width rounding of a batch; coarser means fewer, fuller batches.
-        let round: usize = std::env::var("PPGROUP").ok().and_then(|v| v.parse().ok()).unwrap_or(256);
         groups.entry(c.1.1.next_multiple_of(round)).or_default().push(c);
     }
     let (mut batches, mut order) = (Vec::new(), Vec::new());
@@ -401,9 +501,22 @@ fn main() -> Result<(), String> {
             send(k + 1);
             let c = Instant::now();
             let mask = masks.remove(&k).unwrap_or_default();
-            let wr = word_rects(&mask, *w, *h);
+            let (wr, mut lines) = if use_ppdet() {
+                let (pw, ph) = (mask.first().copied().unwrap_or(0) as usize, mask.get(1).copied().unwrap_or(0) as usize);
+                let to_page = [f32::from_bits(mask.get(2).copied().unwrap_or(0)), f32::from_bits(mask.get(3).copied().unwrap_or(0))];
+                let prob: Vec<f32> = mask.iter().skip(4).map(|&v| f32::from_bits(v)).collect();
+                let t0 = Instant::now();
+                let boxes = wgpu_ocr::ppdet::boxes(&prob, pw, ph, to_page, wgpu_ocr::ppdet::Db::default());
+                if std::env::var_os("DETDEBUG").is_some() {
+                    eprintln!("  DB post-processing page {k}: {:.0} ms, {} boxes", ms(t0), boxes.len());
+                }
+                (boxes.clone(), boxes.into_iter().map(|b| vec![b]).collect::<Vec<_>>())
+            } else {
+                let wr = word_rects(&mask, *w, *h);
+                let lines = engine.find_text_lines(&input, &wr);
+                (wr, lines)
+            };
             word_counts[k] = wr.len();
-            let mut lines = engine.find_text_lines(&input, &wr);
             // EXPANDEND / EXPANDV: widen the first and last word of each found line (and all
             // words vertically), so the line image keeps the edge characters; line finding is
             // unaffected.
@@ -421,8 +534,11 @@ fn main() -> Result<(), String> {
             // RELV / RELEND: the same as fractions of the line's median word height, so they
             // scale with the resolution. A rect whose up axis is horizontal has width and
             // height swapped.
-            let relv: f32 = std::env::var("RELV").ok().and_then(|v| v.parse().ok()).unwrap_or(0.15);
-            let relend: f32 = std::env::var("RELEND").ok().and_then(|v| v.parse().ok()).unwrap_or(0.1);
+            // DB boxes get 0.1 of their height above and below: narrower recognition inputs, and
+            // no word errors on the validation pages.
+            let default_pad = if use_ppdet() { 0.1 } else { 0.15 };
+            let relv: f32 = std::env::var("RELV").ok().and_then(|v| v.parse().ok()).unwrap_or(default_pad);
+            let relend: f32 = std::env::var("RELEND").ok().and_then(|v| v.parse().ok()).unwrap_or(if use_ppdet() { 0.0 } else { 0.1 });
             if relv > 0.0 || relend > 0.0 {
                 for line in &mut lines {
                     let upright = |r: &RotatedRect| r.up_axis().y.abs() >= r.up_axis().x.abs();
@@ -480,6 +596,11 @@ fn main() -> Result<(), String> {
         for (k, ((ct, _), gt)) in cpu.iter().zip(&gpu_text).enumerate().take(paths.len()) {
             std::fs::write(format!("{dir}/ocrs_{k}.txt"), ct.join("\n")).map_err(|e| e.to_string())?;
             std::fs::write(format!("{dir}/gpu_{k}.txt"), gt.join("\n")).map_err(|e| e.to_string())?;
+        }
+    }
+    if std::env::var_os("NDPROFILE").is_some() {
+        for (k, t, c) in nd::profile().iter().take(14) {
+            println!("  {k:<22} {c:>5} x {t:8.1} ms");
         }
     }
     let (mut same, mut total, mut words_same) = (0, 0, 0);

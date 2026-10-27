@@ -109,6 +109,100 @@ ENTRY
 }
 "#;
 
+/// The same with a workgroup per row, for long rows (squeeze-excitation over H x W).
+const REDUCE_MEAN_WIDE: &str = r#"
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read_write> y: array<f32>;
+@group(0) @binding(2) var<uniform> p: vec4<u32>;  // outer, inner
+var<workgroup> part: array<f32, 256>;
+@compute @workgroup_size(256)
+fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nw: vec3<u32>) {
+    let row = wid.y * nw.x + wid.x;
+    var s = 0.0;
+    if (row < p.x) {
+        for (var j = lid.x; j < p.y; j += 256u) { s += x[row * p.y + j]; }
+    }
+    part[lid.x] = s;
+    workgroupBarrier();
+    for (var k = 128u; k > 0u; k = k / 2u) {
+        if (lid.x < k) { part[lid.x] += part[lid.x + k]; }
+        workgroupBarrier();
+    }
+    if (lid.x == 0u && row < p.x) { y[row] = part[0] / f32(p.y); }
+}
+"#;
+
+/// LayerNorm over the last axis: (x - mean) / sqrt(var + eps) * gamma + beta, a thread per row.
+const LAYER_NORM: &str = r#"
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read> gb: array<f32>;  // gamma[len] then beta[len]
+@group(0) @binding(2) var<storage, read_write> y: array<f32>;
+@group(0) @binding(3) var<uniform> p: vec4<u32>;  // rows, len, eps bits
+ENTRY
+    INDEX
+    if (i >= p.x) { return; }
+    let base = i * p.y;
+    var m = 0.0;
+    for (var j = 0u; j < p.y; j++) { m += x[base + j]; }
+    m = m / f32(p.y);
+    var v = 0.0;
+    for (var j = 0u; j < p.y; j++) { let d = x[base + j] - m; v += d * d; }
+    let inv = 1.0 / sqrt(v / f32(p.y) + bitcast<f32>(p.z));
+    for (var j = 0u; j < p.y; j++) { y[base + j] = (x[base + j] - m) * inv * gb[j] + gb[p.y + j]; }
+}
+"#;
+
+/// Nearest-neighbour Resize, asymmetric coordinates, floor: in = min(floor(out / scale), size - 1).
+const RESIZE_NEAREST: &str = r#"
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read_write> y: array<f32>;
+@group(0) @binding(2) var<storage, read> p: array<u32>;  // nc, h, w, oh, ow, sy bits, sx bits
+ENTRY
+    INDEX
+    if (i >= p[0] * p[3] * p[4]) { return; }
+    let ox = i % p[4];
+    let oy = (i / p[4]) % p[3];
+    let c = i / (p[4] * p[3]);
+    let iy = min(u32(floor(f32(oy) / bitcast<f32>(p[5]))), p[1] - 1u);
+    let ix = min(u32(floor(f32(ox) / bitcast<f32>(p[6]))), p[2] - 1u);
+    y[i] = x[(c * p[1] + iy) * p[2] + ix];
+}
+"#;
+
+/// PP-OCR detection input on the GPU: the page's RGB bytes (4 to a word) resized bilinearly
+/// (half-pixel, clamped), in BGR order, normalised with the ImageNet mean and deviation.
+const DET_PREP: &str = r#"
+@group(0) @binding(0) var<storage, read> rgb: array<u32>;
+@group(0) @binding(1) var<storage, read_write> y: array<f32>;
+@group(0) @binding(2) var<storage, read> p: array<u32>;  // w, h, ow, oh, sx bits, sy bits
+fn byte(i: u32) -> f32 { return f32((rgb[i / 4u] >> ((i % 4u) * 8u)) & 255u); }
+ENTRY
+    INDEX
+    let ow = p[2];
+    let oh = p[3];
+    if (i >= ow * oh) { return; }
+    let ox = i % ow;
+    let oy = i / ow;
+    let ix = clamp(bitcast<f32>(p[4]) * (f32(ox) + 0.5) - 0.5, 0.0, f32(p[0]) - 1.0);
+    let iy = clamp(bitcast<f32>(p[5]) * (f32(oy) + 0.5) - 0.5, 0.0, f32(p[1]) - 1.0);
+    let x1 = u32(ix);
+    let y1 = u32(iy);
+    let x2 = min(x1 + 1u, p[0] - 1u);
+    let y2 = min(y1 + 1u, p[1] - 1u);
+    let fx = ix - f32(x1);
+    let fy = iy - f32(y1);
+    let mean = array<f32, 3>(0.485, 0.456, 0.406);
+    let dev = array<f32, 3>(0.229, 0.224, 0.225);
+    for (var c = 0u; c < 3u; c++) {
+        // BGR: output channel 0 is blue, byte 2 of the pixel.
+        let k = 2u - c;
+        let a = mix(byte((y1 * p[0] + x1) * 3u + k), byte((y1 * p[0] + x2) * 3u + k), fx);
+        let b = mix(byte((y2 * p[0] + x1) * 3u + k), byte((y2 * p[0] + x2) * 3u + k), fx);
+        y[c * ow * oh + i] = (mix(a, b, fy) / 255.0 - mean[c]) / dev[c];
+    }
+}
+"#;
+
 const SOFTMAX: &str = r#"
 @group(0) @binding(0) var<storage, read> x: array<f32>;
 @group(0) @binding(1) var<storage, read_write> y: array<f32>;
@@ -318,6 +412,10 @@ pub(crate) fn shaders() -> Vec<(&'static str, String)> {
         ("nd_binary", shader(BINARY)),
         ("nd_unary", shader(UNARY)),
         ("nd_reduce_mean", shader(REDUCE_MEAN)),
+        ("nd_reduce_mean_wide", REDUCE_MEAN_WIDE.to_string()),
+        ("nd_layer_norm", shader(LAYER_NORM)),
+        ("nd_resize", shader(RESIZE_NEAREST)),
+        ("nd_det_prep", shader(DET_PREP)),
         ("nd_softmax", shader(SOFTMAX)),
         ("nd_copy", shader(COPY)),
         ("nd_pool", shader(POOL)),
@@ -374,11 +472,16 @@ struct ConvW {
 
 /// What a fused node does.
 enum Fused {
-    /// The conv, its activation, and a tensor added after it (a residual).
-    Conv(ConvW, u32, Option<String>),
+    /// The conv, its activation, a tensor added after it (a residual), and a [n, cin] scale its
+    /// input is multiplied by first (squeeze-excitation).
+    Conv(ConvW, u32, Option<String>, Option<String>),
     /// MatMul with a constant [K, N] weight, its bias, its activation.
     Linear { w: Buf, b: Buf, k: usize, n: usize, act: u32 },
     Affine { st: Buf },
+    /// ConvTranspose (group 1, no padding) with its bias and activation.
+    ConvT { w: Buf, b: Buf, cin: usize, cout: usize, kh: usize, kw: usize, stride: usize, act: u32 },
+    /// The exporter's LayerNorm chain over the last axis.
+    LayerNorm { gb: Buf, len: usize, eps: f32 },
 }
 
 pub struct NdGraph {
@@ -386,6 +489,8 @@ pub struct NdGraph {
     /// Float initializers on the GPU, with their shapes.
     weights: HashMap<String, Tensor>,
     ints: HashMap<String, Vec<i64>>,
+    /// Small float constants kept on the CPU too (Resize scales).
+    scales: HashMap<String, Vec<f32>>,
     /// Per node index: a fused implementation, and the nodes it swallowed.
     fused: HashMap<usize, Fused>,
     skip: Vec<bool>,
@@ -430,13 +535,80 @@ impl NdGraph {
             weights.insert(name.clone(), Tensor { buf: gpu.upload(&w.data), shape: w.dims.clone() });
         }
         let scalar = |name: &str| onnx.weights.get(name).filter(|w| w.data.len() == 1).map(|w| w.data[0]);
-        let readers = |name: &str| nodes.iter().filter(|n| n.inputs.iter().any(|i| i == name)).count() + usize::from(name == output);
+        let count_readers = |nodes: &[Node], skip: &[bool]| {
+            let mut c: HashMap<String, usize> = HashMap::new();
+            for (k, n) in nodes.iter().enumerate() {
+                if !skip[k] {
+                    for i in &n.inputs {
+                        *c.entry(i.clone()).or_default() += 1;
+                    }
+                }
+            }
+            c
+        };
         let (mut fused, mut skip) = (HashMap::new(), vec![false; nodes.len()]);
+        let first = count_readers(&nodes, &skip);
+        let readers = |name: &str| first.get(name).copied().unwrap_or(0) + usize::from(name == output);
+        // Squeeze-excitation: Mul(x, s) with s [n, c, 1, 1], read only by a dense Conv, becomes
+        // that conv's input scale.
+        let mut in_scale: HashMap<usize, String> = HashMap::new();
+        let mut se: Vec<(usize, usize, String, String)> = Vec::new();
+        for (mi, m) in nodes.iter().enumerate() {
+            if m.op != "Mul" || readers(&m.outputs[0]) != 1 {
+                continue;
+            }
+            let Some(ci) = nodes.iter().position(|c| c.op == "Conv" && c.inputs[0] == m.outputs[0] && c.int("group").unwrap_or(1) == 1) else { continue };
+            let gate = |name: &str| nodes.iter().any(|g| g.op == "HardSigmoid" && g.outputs[0] == name);
+            let (x, sc) = if gate(&m.inputs[1]) { (&m.inputs[0], &m.inputs[1]) } else if gate(&m.inputs[0]) { (&m.inputs[1], &m.inputs[0]) } else { continue };
+            se.push((mi, ci, x.clone(), sc.clone()));
+        }
+        if std::env::var_os("NOSE").is_none() {
+            for (mi, ci, x, sc) in se {
+                in_scale.insert(ci, sc);
+                skip[mi] = true;
+                nodes[ci].inputs[0] = x;
+            }
+        }
+        let counts = count_readers(&nodes, &skip);
+        let readers = |name: &str| counts.get(name).copied().unwrap_or(0) + usize::from(name == output);
         // (node, new output): a fused node writes its last swallowed node's output.
         let mut renames: Vec<(usize, String)> = Vec::new();
         let mut i = 0;
         while i < nodes.len() {
+            if skip[i] {
+                i += 1;
+                continue;
+            }
             let n = &nodes[i];
+            // LayerNorm: ReduceMean, Sub, Pow 2, ReduceMean, Add eps, Sqrt, Div, Mul gamma, Add beta.
+            if n.op == "ReduceMean"
+                && let Some(chain) = nodes.get(i..i + 9)
+                && let [mean, sub, pow, var, add, sqrt, div, mul, beta] = chain
+                && n.ints("axes").as_deref() == Some(&[-1][..])
+                && sub.op == "Sub" && sub.inputs[0] == mean.inputs[0] && sub.inputs[1] == mean.outputs[0]
+                && pow.op == "Pow" && pow.inputs[0] == sub.outputs[0] && scalar(&pow.inputs[1]) == Some(2.0)
+                && var.op == "ReduceMean" && var.inputs[0] == pow.outputs[0] && var.ints("axes").as_deref() == Some(&[-1][..])
+                && add.op == "Add" && add.inputs[0] == var.outputs[0] && scalar(&add.inputs[1]).is_some()
+                && sqrt.op == "Sqrt" && sqrt.inputs[0] == add.outputs[0]
+                && div.op == "Div" && div.inputs[0] == sub.outputs[0] && div.inputs[1] == sqrt.outputs[0]
+                && mul.op == "Mul" && mul.inputs[0] == div.outputs[0] && onnx.weights.contains_key(&mul.inputs[1])
+                && beta.op == "Add" && beta.inputs[0] == mul.outputs[0] && onnx.weights.contains_key(&beta.inputs[1])
+                && readers(&mean.outputs[0]) == 1
+                && readers(&sub.outputs[0]) == 2
+                && [&pow.outputs[0], &var.outputs[0], &add.outputs[0], &sqrt.outputs[0], &div.outputs[0], &mul.outputs[0]].iter().all(|o| readers(o) == 1)
+            {
+                let (g, b) = (onnx.weight(&mul.inputs[1])?, onnx.weight(&beta.inputs[1])?);
+                let mut gb = g.data.clone();
+                gb.extend_from_slice(&b.data);
+                let eps = scalar(&add.inputs[1]).unwrap_or(1e-5);
+                fused.insert(i, Fused::LayerNorm { gb: gpu.upload(&gb), len: g.data.len(), eps });
+                for k in i + 1..i + 9 {
+                    skip[k] = true;
+                }
+                renames.push((i, beta.outputs[0].clone()));
+                i += 9;
+                continue;
+            }
             // A following Add of a constant bias, then an activation, each read only here.
             let mut j = i + 1;
             let mut out = n.outputs[0].clone();
@@ -550,7 +722,7 @@ impl NdGraph {
                         same_upper: auto == "SAME_UPPER",
                         fast,
                     };
-                    fused.insert(i, Fused::Conv(conv, act, residual));
+                    fused.insert(i, Fused::Conv(conv, act, residual, in_scale.get(&i).cloned()));
                 }
                 "MatMul" if onnx.weights.get(&n.inputs[1]).is_some_and(|w| w.dims.len() == 2) => {
                     let w = onnx.weight(&n.inputs[1])?;
@@ -580,6 +752,39 @@ impl NdGraph {
                     }
                     fused.insert(i, Fused::Linear { w: gpu.upload(&w.data), b: gpu.upload(&b), k, n: nn, act });
                 }
+                "ConvTranspose" => {
+                    let w = onnx.weight(&n.inputs[1])?;
+                    let [cin, cout, kh, kw] = <[usize; 4]>::try_from(w.dims.clone()).map_err(|_| "ConvTranspose weight not 4D")?;
+                    let strides = n.ints("strides").unwrap_or_else(|| vec![1, 1]);
+                    if n.int("group").unwrap_or(1) != 1
+                        || n.ints("pads").is_some_and(|p| p.iter().any(|&x| x != 0))
+                        || n.ints("output_padding").is_some_and(|p| p.iter().any(|&x| x != 0))
+                        || strides[0] != strides[1]
+                    {
+                        return Err("unsupported ConvTranspose attributes".into());
+                    }
+                    let mut b = n.inputs.get(2).filter(|s| !s.is_empty()).and_then(|s| onnx.weights.get(s)).map(|w| w.data.clone()).unwrap_or_else(|| vec![0.0; cout]);
+                    if let Some(next) = nodes.get(j)
+                        && let Some(name) = takes_bias(next, &out, cout)
+                    {
+                        for (x, y) in b.iter_mut().zip(&onnx.weight(&name)?.data) {
+                            *x += y;
+                        }
+                        out = next.outputs[0].clone();
+                        j += 1;
+                    }
+                    let mut act = 0;
+                    if let Some(next) = nodes.get(j)
+                        && (next.op == "Relu" || next.op == "Sigmoid")
+                        && next.inputs[0] == out
+                        && readers(&out) == 1
+                    {
+                        act = if next.op == "Relu" { 1 } else { 2 };
+                        out = next.outputs[0].clone();
+                        j += 1;
+                    }
+                    fused.insert(i, Fused::ConvT { w: gpu.upload(&w.data), b: gpu.upload(&b), cin, cout, kh, kw, stride: strides[0] as usize, act });
+                }
                 "BatchNormalization" => {
                     let g = |k: usize| onnx.weight(&n.inputs[k]).map(|w| w.data.clone());
                     let (scale, shift, mean, var) = (g(1)?, g(2)?, g(3)?, g(4)?);
@@ -607,7 +812,8 @@ impl NdGraph {
             nodes[i].outputs[0] = out;
         }
         let input = onnx.input.clone();
-        Ok(Self { nodes, weights, ints: onnx.ints.clone(), fused, skip, input, output })
+        let scales = onnx.weights.iter().filter(|(_, w)| w.data.len() <= 8).map(|(k, w)| (k.clone(), w.data.clone())).collect();
+        Ok(Self { nodes, weights, ints: onnx.ints.clone(), scales, fused, skip, input, output })
     }
 
     fn get(&self, values: &HashMap<String, Value>, name: &str) -> Result<Value, String> {
@@ -653,15 +859,78 @@ impl NdGraph {
                 }
             };
             let out: Value = match (n.op.as_str(), self.fused.get(&idx)) {
-                ("Conv", Some(Fused::Conv(c, act, res))) => {
-                    let r = match res {
-                        Some(name) => match self.get(&values, name)? {
-                            Value::F(t) => Some(t),
-                            Value::I(..) => return Err("integer residual".into()),
-                        },
-                        None => None,
+                ("Conv", Some(Fused::Conv(c, act, res, sc))) => {
+                    let tensor = |name: &Option<String>| -> Result<Option<Tensor>, String> {
+                        match name {
+                            Some(name) => match self.get(&values, name)? {
+                                Value::F(t) => Ok(Some(t)),
+                                Value::I(..) => Err("integer input to a fused conv".into()),
+                            },
+                            None => Ok(None),
+                        }
                     };
-                    Value::F(self.conv(gpu, enc, &float(0)?, c, *act, r.as_ref(), scratch, &mut keep)?)
+                    let (r, s) = (tensor(res)?, tensor(sc)?);
+                    Value::F(self.conv(gpu, enc, &float(0)?, c, *act, r.as_ref(), s.as_ref(), scratch, &mut keep)?)
+                }
+                ("ConvTranspose", Some(Fused::ConvT { w, b, cin, cout, kh, kw, stride, act })) => {
+                    let a = float(0)?;
+                    let [nb, c, h, wd] = <[usize; 4]>::try_from(a.shape.clone()).map_err(|_| format!("ConvTranspose input {:?}", a.shape))?;
+                    if c != *cin {
+                        return Err(format!("ConvTranspose expects {cin} channels, has {c}"));
+                    }
+                    let (oh, ow) = ((h - 1) * stride + kh, (wd - 1) * stride + kw);
+                    let y = new(&[nb, *cout, oh, ow], scratch);
+                    let p = gpu.uniform(&[nb, *cin, h, wd, *cout, oh, ow, *kh, *kw, *stride, *act as usize, 0].map(|v| v as u32));
+                    gpu.elementwise(enc, "convt", &[&a.buf, w, b, &y.buf, &p], nb * cout * oh * ow);
+                    keep.push(p);
+                    Value::F(y)
+                }
+                ("Resize", _) => {
+                    let a = float(0)?;
+                    if n.string("mode").as_deref() != Some("nearest") || n.string("coordinate_transformation_mode").as_deref() != Some("asymmetric") {
+                        return Err("Resize other than nearest/asymmetric".into());
+                    }
+                    let sc = self.scales.get(&n.inputs[2]).ok_or("Resize scales")?;
+                    let [nb, c, h, wd] = <[usize; 4]>::try_from(a.shape.clone()).map_err(|_| format!("Resize input {:?}", a.shape))?;
+                    if sc.len() != 4 || sc[0] != 1.0 || sc[1] != 1.0 {
+                        return Err(format!("Resize scales {sc:?}"));
+                    }
+                    let (oh, ow) = ((h as f32 * sc[2]).floor() as usize, (wd as f32 * sc[3]).floor() as usize);
+                    let y = new(&[nb, c, oh, ow], scratch);
+                    let pb = gpu.upload_u32(&[(nb * c) as u32, h as u32, wd as u32, oh as u32, ow as u32, sc[2].to_bits(), sc[3].to_bits()]);
+                    gpu.elementwise(enc, "nd_resize", &[&a.buf, &y.buf, &pb], nb * c * oh * ow);
+                    keep.push(pb);
+                    Value::F(y)
+                }
+                ("GlobalAveragePool", _) => {
+                    let a = float(0)?;
+                    if a.shape.len() < 3 {
+                        return Err(format!("GlobalAveragePool on {:?}", a.shape));
+                    }
+                    let inner: usize = a.shape[2..].iter().product();
+                    let outer = a.shape.iter().product::<usize>() / inner.max(1);
+                    let shape: Vec<usize> = a.shape.iter().enumerate().map(|(d, &s)| if d >= 2 { 1 } else { s }).collect();
+                    let y = new(&shape, scratch);
+                    let p = gpu.uniform(&[outer as u32, inner as u32, 0, 0]);
+                    if inner >= 512 {
+                        gpu.dispatch(enc, "nd_reduce_mean_wide", &[&a.buf, &y.buf, &p], (outer.min(65535) as u32, outer.div_ceil(65535) as u32));
+                    } else {
+                        gpu.elementwise(enc, "nd_reduce_mean", &[&a.buf, &y.buf, &p], outer);
+                    }
+                    keep.push(p);
+                    Value::F(y)
+                }
+                ("ReduceMean", Some(Fused::LayerNorm { gb, len, eps })) => {
+                    let a = float(0)?;
+                    if a.shape.last() != Some(len) {
+                        return Err(format!("LayerNorm over {:?}, expects {len}", a.shape));
+                    }
+                    let rows = a.shape.iter().product::<usize>() / len;
+                    let y = new(&a.shape, scratch);
+                    let p = gpu.uniform(&[rows as u32, *len as u32, eps.to_bits(), 0]);
+                    gpu.elementwise(enc, "nd_layer_norm", &[&a.buf, gb, &y.buf, &p], rows);
+                    keep.push(p);
+                    Value::F(y)
                 }
                 ("MatMul", Some(Fused::Linear { w, b, k, n: nn, act })) => {
                     let a = float(0)?;
@@ -751,7 +1020,11 @@ impl NdGraph {
                     let shape: Vec<usize> = a.shape.iter().enumerate().filter_map(|(d, &s)| if axes.contains(&d) { keepdims.then_some(1) } else { Some(s) }).collect();
                     let y = new(&shape, scratch);
                     let p = gpu.uniform(&[outer as u32, inner as u32, 0, 0]);
-                    gpu.elementwise(enc, "nd_reduce_mean", &[&a.buf, &y.buf, &p], outer);
+                    if inner >= 512 {
+                        gpu.dispatch(enc, "nd_reduce_mean_wide", &[&a.buf, &y.buf, &p], (outer.min(65535) as u32, outer.div_ceil(65535) as u32));
+                    } else {
+                        gpu.elementwise(enc, "nd_reduce_mean", &[&a.buf, &y.buf, &p], outer);
+                    }
                     keep.push(p);
                     Value::F(y)
                 }
@@ -895,7 +1168,7 @@ impl NdGraph {
                 let done = std::mem::replace(enc, gpu.encoder());
                 gpu.submit_wait(done);
                 let label = match self.fused.get(&idx) {
-                    Some(Fused::Conv(c, _, _)) => format!("Conv {}x{} g{}", c.kh, c.kw, if c.group == 1 { "1".to_string() } else { "dw".into() }),
+                    Some(Fused::Conv(c, _, _, _)) => format!("Conv {}x{} g{}", c.kh, c.kw, if c.group == 1 { "1".to_string() } else { "dw".into() }),
                     Some(Fused::Linear { n, .. }) => format!("Linear ->{n}"),
                     _ => n.op.clone(),
                 };
@@ -990,7 +1263,7 @@ impl NdGraph {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn conv(&self, gpu: &Gpu, enc: &mut wgpu::CommandEncoder, a: &Tensor, c: &ConvW, act: u32, res: Option<&Tensor>, scratch: &mut Vec<Buf>, keep: &mut Vec<Buf>) -> Result<Tensor, String> {
+    fn conv(&self, gpu: &Gpu, enc: &mut wgpu::CommandEncoder, a: &Tensor, c: &ConvW, act: u32, res: Option<&Tensor>, scale: Option<&Tensor>, scratch: &mut Vec<Buf>, keep: &mut Vec<Buf>) -> Result<Tensor, String> {
         let [n, cin, h, w] = <[usize; 4]>::try_from(a.shape.clone()).map_err(|_| format!("Conv input {:?}", a.shape))?;
         let [sh, sw] = c.stride;
         // Leading and trailing padding; SAME_UPPER puts the odd one at the end.
@@ -1012,19 +1285,25 @@ impl NdGraph {
         {
             return Err(format!("residual {:?} for a conv giving {:?}", r.shape, [n, c.cout, oh, ow]));
         }
-        if res.is_some() && c.group != 1 {
+        if let Some(s) = scale
+            && s.shape.iter().product::<usize>() != n * cin
+        {
+            return Err(format!("input scale {:?} for {:?}", s.shape, a.shape));
+        }
+        if (res.is_some() || scale.is_some()) && c.group != 1 {
             return Err("residual after a grouped conv".into());
         }
         if c.group == 1 {
             if c.cin_g != cin {
                 return Err(format!("Conv expects {} channels, has {cin}", c.cin_g));
             }
-            let p = gpu.uniform(&[n, cin, h, w, c.cout, oh, ow, c.kh, c.kw, pt, sh, act as usize, pl, sw, usize::from(res.is_some()), 0].map(|v| v as u32));
+            let p = gpu.uniform(&[n, cin, h, w, c.cout, oh, ow, c.kh, c.kw, pt, sh, act as usize, pl, sw, usize::from(res.is_some()), usize::from(scale.is_some())].map(|v| v as u32));
             // The 128-pixel tile where it pays (NO128 keeps 64, better on RDNA 3.5).
             let wide = c.fast && std::env::var_os("NO128").is_none();
             let (pipe, mtile) = if wide { ("conv128", 128) } else if c.fast { ("conv_fast", 64) } else { ("conv", 64) };
             let rb = res.map_or(&a.buf, |r| &r.buf);
-            gpu.dispatch(enc, pipe, &[&a.buf, &c.w, &c.b, &y, &p, rb], ((n * oh * ow).div_ceil(mtile) as u32, c.cout.div_ceil(64) as u32));
+            let sb = scale.map_or(&a.buf, |s| &s.buf);
+            gpu.dispatch(enc, pipe, &[&a.buf, &c.w, &c.b, &y, &p, rb, sb], ((n * oh * ow).div_ceil(mtile) as u32, c.cout.div_ceil(64) as u32));
             keep.push(p);
         } else if c.cin_g == 1 && c.group == cin && c.group == c.cout {
             let p = gpu.uniform(&[n, cin, h, w, oh, ow, c.kh, c.kw, pt, sh, act as usize, pl, sw].map(|v| v as u32));
@@ -1067,6 +1346,37 @@ impl NdGraph {
         gpu.elementwise(enc, "nd_pool", &[&a.buf, &y, &p], n * c * oh * ow);
         keep.push(p);
         Ok(Tensor { buf: y, shape: vec![n, c, oh, ow] })
+    }
+
+    /// The PP-OCR detection input for an RGB page, prepared on the GPU: [1, 3, oh, ow] with the
+    /// sizes chosen as `ppdet::det_input` chooses them. Returns it and the factors back to the page.
+    pub fn det_input(gpu: &Gpu, enc: &mut wgpu::CommandEncoder, rgb: &[u8], w: usize, h: usize, max_side: usize, scratch: &mut Vec<Buf>) -> (Tensor, [f32; 2]) {
+        let ratio = if w.max(h) > max_side { max_side as f32 / w.max(h) as f32 } else { 1.0 };
+        let round = |v: f32| ((v / 32.0).round() as usize * 32).max(32);
+        let (ow, oh) = (round(w as f32 * ratio), round(h as f32 * ratio));
+        let mut words: Vec<u32> = vec![0; rgb.len().div_ceil(4)];
+        for (k, c) in rgb.chunks(4).enumerate() {
+            let mut b = [0u8; 4];
+            b[..c.len()].copy_from_slice(c);
+            words[k] = u32::from_le_bytes(b);
+        }
+        let src = gpu.upload_u32(&words);
+        let y = gpu.storage(3 * ow * oh);
+        scratch.push(y.clone());
+        let p = gpu.upload_u32(&[w as u32, h as u32, ow as u32, oh as u32, (w as f32 / ow as f32).to_bits(), (h as f32 / oh as f32).to_bits()]);
+        gpu.elementwise(enc, "nd_det_prep", &[&src, &y, &p], ow * oh);
+        (Tensor { buf: y, shape: vec![1, 3, oh, ow] }, [w as f32 / ow as f32, h as f32 / oh as f32])
+    }
+
+    /// Record the arg-max over the last axis of `logits` per row; returns the u32 buffer and
+    /// its length, to read later (with others, in one wait).
+    pub fn argmax_record(&self, gpu: &Gpu, enc: &mut wgpu::CommandEncoder, logits: &Tensor) -> (Buf, usize) {
+        let len = *logits.shape.last().unwrap_or(&1);
+        let rows = logits.shape.iter().product::<usize>() / len.max(1);
+        let y = gpu.storage(rows);
+        let p = gpu.uniform(&[rows as u32, len as u32, 0, 0]);
+        gpu.dispatch(enc, "nd_argmax", &[&logits.buf, &y, &p], (rows.min(65535) as u32, rows.div_ceil(65535) as u32));
+        (y, rows)
     }
 
     /// The arg-max over the last axis of `logits`, per row, read back.
