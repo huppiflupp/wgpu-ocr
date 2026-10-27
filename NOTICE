@@ -6,5 +6,9 @@ Third-party parts:
   0.13.1 (src/detection.rs), Copyright Robert Knight, licensed MIT OR Apache-2.0.
 - The models are not part of this repository. scripts/fetch-models.sh downloads the ocrs
   models (CC-BY-SA-4.0, Robert Knight, https://github.com/robertknight/ocrs-models).
+- scripts/fetch-models.sh also downloads PaddleOCR's PP-OCRv6 small recognition model and its
+  dictionary (Apache-2.0, PaddlePaddle, https://github.com/PaddlePaddle/PaddleOCR).
+  src/ppocr.rs follows PaddleOCR's documented preprocessing (height 48, (v / 255 - 0.5) / 0.5)
+  and character list (blank, dictionary, space).
 - The test pages in data/pages are rendered from the texts in data/ with PdfCraft
   (https://github.com/storytold/pdfcraft); the texts were written for this benchmark.

@@ -6,7 +6,12 @@
 //! jobs waiting together are merged into one pass. CPU: words from the mask (contours), lines,
 //! line images, while the GPU works on the previous page.
 
-use wgpu_ocr::{gpu, onnx};
+use wgpu_ocr::{gpu, nd, onnx, ppocr};
+
+/// REC=ppocr: recognise with PP-OCRv6 (models/ppocr) instead of the ocrs recogniser.
+fn use_ppocr() -> bool {
+    std::env::var("REC").is_ok_and(|v| v == "ppocr")
+}
 
 use std::collections::BTreeMap;
 use std::sync::mpsc;
@@ -125,9 +130,15 @@ fn gpu_thread(jobs: mpsc::Receiver<Job>, done: mpsc::Sender<Done>, threshold: f3
         let gpu = gpu::Gpu::new(lines)?;
         let det = gpu::Detector::new(&gpu, &onnx::Onnx::load(&format!("{models}/text-detection.onnx"))?)?;
         let rec = gpu::Recognizer::new(&gpu, &onnx::Onnx::load(&format!("{models}/text-recognition.onnx"))?, lines)?;
-        Ok((gpu, det, rec))
+        let pp = if use_ppocr() {
+            let path = format!("{models}/ppocr/PP-OCRv6_small_rec.onnx");
+            Some((nd::NdGraph::new(&gpu, &onnx::Onnx::load(&path)?, true)?, ppocr::Dictionary::load(&format!("{models}/ppocr/ppocrv6_dict.txt"))?))
+        } else {
+            None
+        };
+        Ok((gpu, det, rec, pp))
     })();
-    let (gpu, det, rec) = match setup {
+    let (gpu, det, rec, pp) = match setup {
         Ok(s) => {
             let _ = ready.send(Ok(s.0.adapter.clone()));
             s
@@ -162,6 +173,35 @@ fn gpu_thread(jobs: mpsc::Receiver<Job>, done: mpsc::Sender<Done>, threshold: f3
             continue;
         }
         let recs: Vec<RecPage> = std::mem::take(&mut held);
+        if let Some((graph, dict)) = &pp {
+            // PP-OCRv6: each batch [n, 3, 48, width] through the graph, arg-max on the GPU.
+            for r in recs {
+                let part = (|| -> Result<Vec<(usize, String)>, String> {
+                    let mut out = Vec::new();
+                    let mut k = 0;
+                    for (data, n, w) in &r.batches {
+                        let mut enc = gpu.encoder();
+                        let mut scratch = Vec::new();
+                        let t0 = Instant::now();
+                        let logits = graph.run(&gpu, &mut enc, nd::Tensor { buf: gpu.upload(data), shape: vec![*n, 3, ppocr::HEIGHT, *w] }, &mut scratch)?;
+                        let recorded = ms(t0);
+                        let steps = logits.shape[1];
+                        let best = graph.argmax(&gpu, enc, &logits);
+                        if std::env::var_os("RECTIME").is_some() {
+                            eprintln!("    batch {n}x{w}: recording {recorded:.1} ms, total {:.1} ms", ms(t0));
+                        }
+                        gpu.recycle(scratch);
+                        for j in 0..*n {
+                            out.push((r.order[k], dict.decode(&best[j * steps..(j + 1) * steps])));
+                            k += 1;
+                        }
+                    }
+                    Ok(out)
+                })();
+                let _ = done.send(Done::Part(r.page, part));
+            }
+            continue;
+        }
         let all: Vec<(Vec<f32>, usize, usize)> = recs.iter().flat_map(|r| r.batches.iter().cloned()).collect();
         if all.is_empty() {
             for r in recs {
@@ -187,6 +227,39 @@ fn gpu_thread(jobs: mpsc::Receiver<Job>, done: mpsc::Sender<Done>, threshold: f3
             }
         }
     }
+}
+
+/// PP-OCRv6 line images cut from the page at each (padded) line's box, in parallel, batched by
+/// width rounded up to 32, at most 16 lines.
+fn pp_batches(rgb: &[u8], w: usize, h: usize, lines: &[Vec<RotatedRect>]) -> (Vec<(Vec<f32>, usize, usize)>, Vec<usize>, Vec<usize>) {
+    let boxes: Vec<(usize, [f32; 4])> = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(i, l)| rten_imageproc::bounding_rect(l.iter()).map(|b| (i, [b.left(), b.top(), b.right(), b.bottom()])))
+        .collect();
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+    let chunk = boxes.len().div_ceil(threads).max(1);
+    let crops: Vec<(usize, (Vec<f32>, usize))> = std::thread::scope(|scope| {
+        let handles: Vec<_> = boxes.chunks(chunk).map(|bs| scope.spawn(move || bs.iter().map(|(i, b)| (*i, ppocr::line_input(rgb, w, h, *b))).collect::<Vec<_>>())).collect();
+        handles.into_iter().flat_map(|hd| hd.join().unwrap_or_default()).collect()
+    });
+    let mut groups: BTreeMap<usize, Vec<&(usize, (Vec<f32>, usize))>> = BTreeMap::new();
+    for c in &crops {
+        // PPGROUP: width rounding of a batch; coarser means fewer, fuller batches.
+        let round: usize = std::env::var("PPGROUP").ok().and_then(|v| v.parse().ok()).unwrap_or(256);
+        groups.entry(c.1.1.next_multiple_of(round)).or_default().push(c);
+    }
+    let (mut batches, mut order) = (Vec::new(), Vec::new());
+    for (width, members) in &groups {
+        let per: usize = std::env::var("PPBATCH").ok().and_then(|v| v.parse().ok()).unwrap_or(16);
+        for part in members.chunks(per) {
+            let refs: Vec<&(Vec<f32>, usize)> = part.iter().map(|c| &c.1).collect();
+            batches.push((ppocr::batch(&refs, *width), part.len(), *width));
+            order.extend(part.iter().map(|c| c.0));
+        }
+    }
+    let widths = vec![0; order.len()];
+    (batches, order, widths)
 }
 
 /// ocrs' line images, in parallel, batched as ocrs batches them.
@@ -367,7 +440,7 @@ fn main() -> Result<(), String> {
                     }
                 }
             }
-            let (batches, order, widths) = line_batches(&engine, &input, &lines)?;
+            let (batches, order, widths) = if use_ppocr() { pp_batches(rgb, *w, *h, &lines) } else { line_batches(&engine, &input, &lines)? };
             cpu_busy += ms(c);
             // The last batches, up to CPUSHARE of the work (lines x width), go to rten on the CPU.
             let cost: Vec<usize> = batches.iter().map(|b| b.1 * b.2).collect();

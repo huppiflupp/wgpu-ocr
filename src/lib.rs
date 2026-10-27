@@ -8,4 +8,6 @@
 //!   and the recogniser (convolutional trunk, bidirectional GRU, output layer).
 
 pub mod gpu;
+pub mod nd;
 pub mod onnx;
+pub mod ppocr;

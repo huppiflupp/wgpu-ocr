@@ -36,6 +36,10 @@ impl Node {
     pub fn string(&self, name: &str) -> Option<String> {
         self.attr(name).and_then(|a| a.s.clone())
     }
+
+    pub fn attr_f32(&self, name: &str) -> Option<f32> {
+        self.attr(name).and_then(|a| a.f)
+    }
 }
 
 pub struct Onnx {

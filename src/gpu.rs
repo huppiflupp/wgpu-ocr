@@ -17,9 +17,19 @@ use crate::onnx::{Node, Onnx};
 type Buf = Arc<wgpu::Buffer>;
 
 const EPILOGUE: &str = r#"
+fn erf_approx(v: f32) -> f32 {
+    // Abramowitz & Stegun 7.1.26, absolute error below 1.5e-7.
+    let s = sign(v);
+    let a = abs(v);
+    let t = 1.0 / (1.0 + 0.3275911 * a);
+    let poly = ((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t;
+    return s * (1.0 - poly * exp(-a * a));
+}
 fn activate(v: f32, act: u32) -> f32 {
     if (act == 1u) { return max(v, 0.0); }
     if (act == 2u) { return 1.0 / (1.0 + exp(-v)); }
+    if (act == 3u) { return 0.5 * v * (1.0 + erf_approx(v * 0.70710678118654752)); }
+    if (act == 4u) { return v / (1.0 + exp(-v)); }
     return v;
 }
 "#;
@@ -29,12 +39,13 @@ fn activate(v: f32, act: u32) -> f32 {
 /// slice of K has one tap (ky, kx) and 16 consecutive input channels: no division per element.
 /// Otherwise the weights are [ci][ky][kx][co] and each element decodes its k.
 const CONV: &str = r#"
-struct P { n: u32, cin: u32, h: u32, w: u32, cout: u32, oh: u32, ow: u32, kh: u32, kw: u32, pad: u32, stride: u32, act: u32 }
+struct P { n: u32, cin: u32, h: u32, w: u32, cout: u32, oh: u32, ow: u32, kh: u32, kw: u32, pad: u32, stride: u32, act: u32, padx: u32, stridex: u32, x0: u32, x1: u32 }
 @group(0) @binding(0) var<storage, read> x: array<f32>;
 @group(0) @binding(1) var<storage, read> wt: array<f32>;
 @group(0) @binding(2) var<storage, read> b: array<f32>;
 @group(0) @binding(3) var<storage, read_write> y: array<f32>;
 @group(0) @binding(4) var<uniform> p: P;
+@group(0) @binding(5) var<storage, read> res: array<f32>;  // added to the output when p.x0 == 1
 var<workgroup> As: array<f32, 1024>;
 var<workgroup> Bs: array<f32, 1024>;
 EPILOGUE_FN
@@ -48,7 +59,10 @@ fn put(m: u32, c0: u32, v: vec4<f32>) {
     for (var j = 0u; j < 4u; j++) {
         let c = c0 + j;
         if (c < p.cout) {
-            y[((nb * p.cout + c) * p.oh + oy) * p.ow + ox] = activate(v[j] + b[c], p.act);
+            let o = ((nb * p.cout + c) * p.oh + oy) * p.ow + ox;
+            var r = activate(v[j] + b[c], p.act);
+            if (p.x0 == 1u) { r += res[o]; }
+            y[o] = r;
         }
     }
 }
@@ -70,7 +84,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid
     let oy = tt % p.oh;
     let nb = tt / p.oh;
     let iy0 = i32(oy * p.stride) - i32(p.pad);
-    let ix0 = i32(ox * p.stride) - i32(p.pad);
+    let ix0 = i32(ox * p.stridex) - i32(p.padx);
     let plane = p.h * p.w;
     let xbase = nb * p.cin * plane;
     var acc0 = vec4<f32>(0.0);
@@ -104,12 +118,13 @@ FAST_OR_GENERIC
 /// The fast path with a 128-pixel x 64-channel tile, 8 x 4 outputs per thread, and the tiles
 /// read from workgroup memory as vec4: 3 loads per 32 FMAs instead of 8 per 16.
 const CONV128: &str = r#"
-struct P { n: u32, cin: u32, h: u32, w: u32, cout: u32, oh: u32, ow: u32, kh: u32, kw: u32, pad: u32, stride: u32, act: u32 }
+struct P { n: u32, cin: u32, h: u32, w: u32, cout: u32, oh: u32, ow: u32, kh: u32, kw: u32, pad: u32, stride: u32, act: u32, padx: u32, stridex: u32, x0: u32, x1: u32 }
 @group(0) @binding(0) var<storage, read> x: array<f32>;
 @group(0) @binding(1) var<storage, read> wt: array<f32>;
 @group(0) @binding(2) var<storage, read> b: array<f32>;
 @group(0) @binding(3) var<storage, read_write> y: array<f32>;
 @group(0) @binding(4) var<uniform> p: P;
+@group(0) @binding(5) var<storage, read> res: array<f32>;  // added to the output when p.x0 == 1
 var<workgroup> As: array<vec4<f32>, 512>;   // [16 k][128 m / 4]
 var<workgroup> Bs: array<vec4<f32>, 256>;   // [16 k][64 c / 4]
 EPILOGUE_FN
@@ -123,7 +138,10 @@ fn put(m: u32, c0: u32, v: vec4<f32>) {
     for (var j = 0u; j < 4u; j++) {
         let c = c0 + j;
         if (c < p.cout) {
-            y[((nb * p.cout + c) * p.oh + oy) * p.ow + ox] = activate(v[j] + b[c], p.act);
+            let o = ((nb * p.cout + c) * p.oh + oy) * p.ow + ox;
+            var r = activate(v[j] + b[c], p.act);
+            if (p.x0 == 1u) { r += res[o]; }
+            y[o] = r;
         }
     }
 }
@@ -145,7 +163,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid
     let oy = tt % p.oh;
     let nb = tt / p.oh;
     let iy0 = i32(oy * p.stride) - i32(p.pad);
-    let ix0 = i32(ox * p.stride) - i32(p.pad);
+    let ix0 = i32(ox * p.stridex) - i32(p.padx);
     let plane = p.h * p.w;
     let xbase = nb * p.cin * plane;
     // B: channel tid % 64, k rows tid / 64 + 4e.
@@ -190,12 +208,13 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid
 "#;
 
 const CONV64V: &str = r#"
-struct P { n: u32, cin: u32, h: u32, w: u32, cout: u32, oh: u32, ow: u32, kh: u32, kw: u32, pad: u32, stride: u32, act: u32 }
+struct P { n: u32, cin: u32, h: u32, w: u32, cout: u32, oh: u32, ow: u32, kh: u32, kw: u32, pad: u32, stride: u32, act: u32, padx: u32, stridex: u32, x0: u32, x1: u32 }
 @group(0) @binding(0) var<storage, read> x: array<f32>;
 @group(0) @binding(1) var<storage, read> wt: array<f32>;
 @group(0) @binding(2) var<storage, read> b: array<f32>;
 @group(0) @binding(3) var<storage, read_write> y: array<f32>;
 @group(0) @binding(4) var<uniform> p: P;
+@group(0) @binding(5) var<storage, read> res: array<f32>;  // added to the output when p.x0 == 1
 var<workgroup> As: array<vec4<f32>, 256>;   // [16 k][64 m / 4]
 var<workgroup> Bs: array<vec4<f32>, 256>;   // [16 k][64 c / 4]
 EPILOGUE_FN
@@ -209,7 +228,10 @@ fn put(m: u32, c0: u32, v: vec4<f32>) {
     for (var j = 0u; j < 4u; j++) {
         let c = c0 + j;
         if (c < p.cout) {
-            y[((nb * p.cout + c) * p.oh + oy) * p.ow + ox] = activate(v[j] + b[c], p.act);
+            let o = ((nb * p.cout + c) * p.oh + oy) * p.ow + ox;
+            var r = activate(v[j] + b[c], p.act);
+            if (p.x0 == 1u) { r += res[o]; }
+            y[o] = r;
         }
     }
 }
@@ -231,7 +253,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid
     let oy = tt % p.oh;
     let nb = tt / p.oh;
     let iy0 = i32(oy * p.stride) - i32(p.pad);
-    let ix0 = i32(ox * p.stride) - i32(p.pad);
+    let ix0 = i32(ox * p.stridex) - i32(p.padx);
     let plane = p.h * p.w;
     let xbase = nb * p.cin * plane;
     // B: channel tid % 64, k rows tid / 64 + 4e.
@@ -319,7 +341,7 @@ const INDEX: &str = "let i = (wid.y * nw.x + wid.x) * 256u + lid.x;";
 const ENTRY: &str = "@compute @workgroup_size(256)\nfn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nw: vec3<u32>) {";
 
 const DEPTHWISE: &str = r#"
-struct P { n: u32, c: u32, h: u32, w: u32, oh: u32, ow: u32, kh: u32, kw: u32, pad: u32, stride: u32, act: u32, x0: u32 }
+struct P { n: u32, c: u32, h: u32, w: u32, oh: u32, ow: u32, kh: u32, kw: u32, pad: u32, stride: u32, act: u32, padx: u32, stridex: u32, x0: u32, x1: u32, x2: u32 }
 @group(0) @binding(0) var<storage, read> x: array<f32>;
 @group(0) @binding(1) var<storage, read> wt: array<f32>;   // [c][kh][kw]
 @group(0) @binding(2) var<storage, read> b: array<f32>;
@@ -338,7 +360,7 @@ ENTRY
         let iy = i32(oy * p.stride + ky) - i32(p.pad);
         if (iy < 0 || iy >= i32(p.h)) { continue; }
         for (var kx = 0u; kx < p.kw; kx++) {
-            let ix = i32(ox * p.stride + kx) - i32(p.pad);
+            let ix = i32(ox * p.stridex + kx) - i32(p.padx);
             if (ix < 0 || ix >= i32(p.w)) { continue; }
             acc += x[(nc * p.h + u32(iy)) * p.w + u32(ix)] * wt[(c * p.kh + ky) * p.kw + kx];
         }
@@ -783,7 +805,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid
     )
 }
 
-fn shader(src: &str) -> String {
+pub(crate) fn shader(src: &str) -> String {
     src.replace("EPILOGUE_FN", EPILOGUE).replace("ENTRY", ENTRY).replace("INDEX", INDEX)
 }
 
@@ -798,6 +820,10 @@ pub struct Gpu {
     /// Scratch buffers by size, reused instead of created: wgpu zero-fills every new buffer
     /// before its first use.
     pool: std::cell::RefCell<HashMap<u64, Vec<Buf>>>,
+    /// Bytes held in the pool, capped at `pool_cap`: varied batch shapes would otherwise keep
+    /// buffers of every size ever used.
+    pool_bytes: std::cell::Cell<u64>,
+    pool_cap: u64,
 }
 
 /// A 4D NCHW tensor on the GPU.
@@ -824,7 +850,8 @@ impl Gpu {
         }))
         .map_err(|e| e.to_string())?;
         let mut pipes = HashMap::new();
-        let sources: Vec<(&'static str, String)> = vec![
+        let mut sources: Vec<(&'static str, String)> = crate::nd::shaders();
+        sources.extend([
             ("conv_fast", shader(&CONV.replace("FAST_OR_GENERIC", CONV_FAST_LOAD))),
             ("conv128", shader(CONV128)),
             ("conv64v", shader(CONV64V)),
@@ -858,7 +885,7 @@ impl Gpu {
                     src
                 }
             }),
-        ];
+        ]);
         for (name, src) in sources {
             let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some(name), source: wgpu::ShaderSource::Wgsl(src.into()) });
             let pipe = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -876,7 +903,7 @@ impl Gpu {
             contents: bytemuck::cast_slice(&[0f32; 1024]),
             usage: wgpu::BufferUsages::STORAGE,
         }));
-        Ok(Self { device, queue, adapter: format!("{} ({:?}{})", info.name, info.backend, if f16 { ", R in f16" } else { "" }), pipes, zeros, f16, pool: Default::default() })
+        Ok(Self { device, queue, adapter: format!("{} ({:?}{})", info.name, info.backend, if f16 { ", R in f16" } else { "" }), pipes, zeros, f16, pool: Default::default(), pool_bytes: Default::default(), pool_cap: std::env::var("POOLMB").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(1024) << 20 })
     }
 
     pub fn upload(&self, data: &[f32]) -> Buf {
@@ -887,7 +914,7 @@ impl Gpu {
         }))
     }
 
-    fn upload_u32(&self, data: &[u32]) -> Buf {
+    pub(crate) fn upload_u32(&self, data: &[u32]) -> Buf {
         Arc::new(self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: None,
             contents: bytemuck::cast_slice(data),
@@ -900,6 +927,7 @@ impl Gpu {
         if std::env::var_os("NOPOOL").is_none()
             && let Some(b) = self.pool.borrow_mut().get_mut(&size).and_then(|v| v.pop())
         {
+            self.pool_bytes.set(self.pool_bytes.get().saturating_sub(size));
             return b;
         }
         Arc::new(self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -913,12 +941,18 @@ impl Gpu {
     /// Give scratch buffers back for reuse by later work (queue order keeps them safe).
     pub fn recycle(&self, bufs: impl IntoIterator<Item = Buf>) {
         let mut pool = self.pool.borrow_mut();
-        for b in bufs {
+        // Only scratch buffers (storage + copy source, as `storage` makes them) are reused.
+        let scratch = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC;
+        for b in bufs.into_iter().filter(|b| b.usage() == scratch) {
+            if self.pool_bytes.get() + b.size() > self.pool_cap {
+                continue; // dropped: wgpu frees it once the work using it is done
+            }
+            self.pool_bytes.set(self.pool_bytes.get() + b.size());
             pool.entry(b.size()).or_default().push(b);
         }
     }
 
-    fn uniform(&self, v: &[u32]) -> Buf {
+    pub(crate) fn uniform(&self, v: &[u32]) -> Buf {
         let mut v = v.to_vec();
         while v.len() % 4 != 0 {
             v.push(0);
@@ -930,7 +964,11 @@ impl Gpu {
         }))
     }
 
-    fn dispatch(&self, enc: &mut wgpu::CommandEncoder, pipe: &str, buffers: &[&Buf], groups: (u32, u32)) {
+    pub(crate) fn dispatch(&self, enc: &mut wgpu::CommandEncoder, pipe: &str, buffers: &[&Buf], groups: (u32, u32)) {
+        self.dispatch3(enc, pipe, buffers, (groups.0, groups.1, 1));
+    }
+
+    pub(crate) fn dispatch3(&self, enc: &mut wgpu::CommandEncoder, pipe: &str, buffers: &[&Buf], groups: (u32, u32, u32)) {
         let pipe = &self.pipes[pipe];
         let entries: Vec<wgpu::BindGroupEntry> =
             buffers.iter().enumerate().map(|(i, b)| wgpu::BindGroupEntry { binding: i as u32, resource: b.as_entire_binding() }).collect();
@@ -938,11 +976,11 @@ impl Gpu {
         let mut pass = enc.begin_compute_pass(&Default::default());
         pass.set_pipeline(pipe);
         pass.set_bind_group(0, &bind, &[]);
-        pass.dispatch_workgroups(groups.0, groups.1, 1);
+        pass.dispatch_workgroups(groups.0, groups.1, groups.2);
     }
 
     /// Dispatch one thread per element over a 2D grid of 256-wide workgroups.
-    fn elementwise(&self, enc: &mut wgpu::CommandEncoder, pipe: &str, buffers: &[&Buf], total: usize) {
+    pub(crate) fn elementwise(&self, enc: &mut wgpu::CommandEncoder, pipe: &str, buffers: &[&Buf], total: usize) {
         let g = total.div_ceil(256);
         self.dispatch(enc, pipe, buffers, (g.min(65535) as u32, g.div_ceil(65535) as u32));
     }
@@ -1175,11 +1213,11 @@ impl Graph {
                 Op::Conv { w: wt, b, cin, cout, kh, kw, pad, stride, act, fast } => {
                     let (oh, ow) = ((h + 2 * pad - kh) / stride + 1, (w + 2 * pad - kw) / stride + 1);
                     let y = gpu.storage(n * cout * oh * ow);
-                    let p = gpu.uniform(&[n, *cin, h, w, *cout, oh, ow, *kh, *kw, *pad, *stride, *act as usize].map(|v| v as u32));
+                    let p = gpu.uniform(&[n, *cin, h, w, *cout, oh, ow, *kh, *kw, *pad, *stride, *act as usize, *pad, *stride].map(|v| v as u32));
                     let wide = *fast && std::env::var_os("NO128").is_none();
                     let vec = *fast && std::env::var_os("CONVV").is_some();
                     let (pipe, mtile) = if wide && !vec { ("conv128", 128) } else if vec { ("conv64v", 64) } else if *fast { ("conv_fast", 64) } else { ("conv", 64) };
-                    gpu.dispatch(enc, pipe, &[&a.buf, wt, b, &y, &p], ((n * oh * ow).div_ceil(mtile) as u32, cout.div_ceil(64) as u32));
+                    gpu.dispatch(enc, pipe, &[&a.buf, wt, b, &y, &p, &a.buf], ((n * oh * ow).div_ceil(mtile) as u32, cout.div_ceil(64) as u32));
                     keep.push(p);
                     Tensor { buf: y, shape: [n, *cout, oh, ow] }
                 }
@@ -1195,7 +1233,7 @@ impl Graph {
                 Op::Depthwise { w: wt, b, kh, kw, pad, stride, act } => {
                     let (oh, ow) = ((h + 2 * pad - kh) / stride + 1, (w + 2 * pad - kw) / stride + 1);
                     let y = gpu.storage(n * c * oh * ow);
-                    let p = gpu.uniform(&[n, c, h, w, oh, ow, *kh, *kw, *pad, *stride, *act as usize, 0].map(|v| v as u32));
+                    let p = gpu.uniform(&[n, c, h, w, oh, ow, *kh, *kw, *pad, *stride, *act as usize, *pad, *stride].map(|v| v as u32));
                     gpu.elementwise(enc, "depthwise", &[&a.buf, wt, b, &y, &p], n * c * oh * ow);
                     keep.push(p);
                     Tensor { buf: y, shape: [n, c, oh, ow] }
