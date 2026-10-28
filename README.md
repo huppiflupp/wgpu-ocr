@@ -17,11 +17,11 @@ OCR models running on **wgpu compute shaders**: Vulkan, Metal, DX12, and later W
 | Machine | ocrs on the CPU, page by page | wgpu-ocr, ocrs models | ocrs detection + PP-OCRv6 recognition | PP-OCRv6 detection + recognition |
 |---|---|---|---|---|
 | Core Ultra 5 245K (14 cores) + RTX 5080, Vulkan | 581 ms | **85 ms** (6.9×) | **97 ms** (6.0×) | **136 ms** (4.4×) |
-| Ryzen AI Max+ 395 (16 cores), Radeon 8060S iGPU, RADV | 545 ms | **154 ms** (3.5×) | 242 ms (2.2×)¹ | not measured yet¹ |
+| Ryzen AI Max+ 395 (16 cores), Radeon 8060S iGPU, RADV | 536 ms | **170 ms** (3.2×) | **239 ms** (2.2×) | **290 ms** (1.8×) |
 
 All wgpu-ocr columns run everything on the GPU and overlap GPU and CPU across pages. With ocrs detection, ocrs finds the lines (with line padding). With PP-OCRv6 detection, its DB boxes are the lines.
 
-¹ Measured before the sorted batching. The iGPU was busy with other work when these changes were made.
+On the Radeon 8060S all three run with `NO128=1`; repeated runs there vary by about ±10 ms a page (an earlier, quieter run of the same code gave 154 ms for the ocrs models). The recognised text on the Radeon is as good as on the RTX 5080: 0.05 % WER with the ocrs models, no word errors with PP-OCRv6.
 
 ### Against other engines (Core Ultra 5 245K + RTX 5080, the 4 pages of `A_300`)
 
